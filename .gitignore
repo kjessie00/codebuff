@@ -33,3 +33,11 @@ debug/
 .infisical-cache
 .infisical-cache.tmp
 .infisical.json
+
+# TypeScript compiled files in source directories
+.agents/types/*.js
+.agents/types/*.d.ts
+.agents/types/*.d.ts.map
+common/src/templates/initial-agents-dir/types/*.js
+common/src/templates/initial-agents-dir/types/*.d.ts
+common/src/templates/initial-agents-dir/types/*.d.ts.map
