@@ -1,0 +1,32 @@
+{
+  "name": "@codebuff/adapter",
+  "version": "1.0.0",
+  "description": "Claude Code CLI adapter for Codebuff agent integration",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "build:watch": "tsc --watch",
+    "clean": "rm -rf dist",
+    "type-check": "tsc --noEmit",
+    "dev": "tsc --watch"
+  },
+  "keywords": [
+    "claude-code",
+    "adapter",
+    "cli",
+    "codebuff"
+  ],
+  "author": "Codebuff",
+  "license": "MIT",
+  "dependencies": {
+    "glob": "^11.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.6.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
