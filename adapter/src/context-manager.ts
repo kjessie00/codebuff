@@ -14,7 +14,8 @@
  * @module context-manager
  */
 
-import type { Message, AgentState } from '../../.agents/types/util-types'
+import type { Message } from '../../.agents/types/util-types'
+import type { AgentState } from '../../.agents/types/agent-definition'
 import type { AgentExecutionContext } from './types'
 import { DEFAULT_MAX_STEPS, ID_RANDOM_LENGTH } from './utils/constants'
 
@@ -223,7 +224,7 @@ export class ContextManager {
       runId: this.generateId(),
       parentId: context.parentId,
       messageHistory: context.messageHistory,
-      output: context.output,
+      output: context.output as Record<string, any> | undefined,
     }
   }
 

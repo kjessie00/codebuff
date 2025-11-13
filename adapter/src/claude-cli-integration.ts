@@ -1,23 +1,18 @@
 /**
- * Claude LLM Integration Module
+ * Claude Code CLI Integration Module
  *
- * This module provides the actual integration with Claude via the Anthropic SDK.
+ * This module provides integration with Claude via the FREE Claude Code CLI tool.
  * It handles:
- * - Tool definition building
- * - Message formatting
- * - Response parsing
+ * - Subprocess invocation of the `claude` CLI command
+ * - Message formatting for CLI input
+ * - Response parsing from CLI output
  * - Tool call execution loop
  * - Error handling and timeouts
+ *
+ * NO API KEYS REQUIRED - Uses your existing Claude Code CLI subscription
  */
 
-import Anthropic from '@anthropic-ai/sdk'
-import type {
-  MessageParam,
-  Tool,
-  ContentBlock,
-  Message as AnthropicMessage,
-} from '@anthropic-ai/sdk/resources/messages'
-
+import { spawn, ChildProcess } from 'child_process'
 import type { Message, ToolResultOutput } from '../../.agents/types/util-types'
 import type { ToolCall } from '../../.agents/types/agent-definition'
 
@@ -55,35 +50,44 @@ export interface ClaudeResponse {
  */
 export type ToolExecutor = (toolCall: ToolCall) => Promise<ToolResultOutput[]>
 
+/**
+ * CLI process options
+ */
+interface CLIProcessOptions {
+  systemPrompt: string
+  userPrompt: string
+  tools?: Array<{
+    name: string
+    description: string
+    input_schema: any
+  }>
+  timeout?: number
+}
+
 // ============================================================================
-// Claude Integration Class
+// Claude CLI Integration Class
 // ============================================================================
 
 /**
- * Handles all interactions with Claude via the Anthropic SDK
+ * Handles all interactions with Claude via the FREE Claude Code CLI
  */
-export class ClaudeIntegration {
-  private readonly client: Anthropic
-  private readonly model: string
+export class ClaudeCLIIntegration {
+  private readonly claudePath: string
   private readonly maxTokens: number
   private readonly timeout: number
   private readonly debug: boolean
   private readonly logger: (message: string, data?: any) => void
 
   constructor(options: {
-    apiKey?: string
-    model?: string
+    claudePath?: string
     maxTokens?: number
     timeout?: number
     debug?: boolean
     logger?: (message: string, data?: any) => void
   }) {
-    // Initialize Anthropic client
-    this.client = new Anthropic({
-      apiKey: options.apiKey || process.env.ANTHROPIC_API_KEY,
-    })
+    // Use Claude CLI from PATH or specified location
+    this.claudePath = options.claudePath || 'claude'
 
-    this.model = options.model || 'claude-sonnet-4-20250514'
     this.maxTokens = options.maxTokens || 8192
     this.timeout = options.timeout || 120000 // 2 minutes default
     this.debug = options.debug || false
@@ -95,7 +99,7 @@ export class ClaudeIntegration {
    *
    * This method handles the complete interaction loop:
    * 1. Format messages and tools
-   * 2. Call Claude API
+   * 2. Call Claude CLI subprocess
    * 3. Process response (text or tool calls)
    * 4. If tool calls, execute them and continue conversation
    * 5. Return final response
@@ -104,7 +108,7 @@ export class ClaudeIntegration {
     params: ClaudeInvocationParams,
     toolExecutor: ToolExecutor
   ): Promise<string> {
-    this.log('Invoking Claude', {
+    this.log('Invoking Claude CLI', {
       systemPromptLength: params.systemPrompt.length,
       messageCount: params.messages.length,
       toolCount: params.tools.length,
@@ -113,13 +117,13 @@ export class ClaudeIntegration {
     // Build tool definitions
     const tools = this.buildToolDefinitions(params.tools)
 
-    // Convert messages to Anthropic format
-    const messages = this.convertMessages(params.messages)
+    // Combine messages into a single conversation
+    const conversationText = this.formatMessages(params.messages)
 
     // Add timeout wrapper
     const timeoutPromise = new Promise<never>((_, reject) => {
       setTimeout(
-        () => reject(new Error('Claude invocation timeout')),
+        () => reject(new Error('Claude CLI invocation timeout')),
         params.timeout || this.timeout
       )
     })
@@ -129,7 +133,7 @@ export class ClaudeIntegration {
       const result = await Promise.race([
         this.executeConversationTurn(
           params.systemPrompt,
-          messages,
+          conversationText,
           tools,
           toolExecutor
         ),
@@ -138,7 +142,7 @@ export class ClaudeIntegration {
 
       return result
     } catch (error) {
-      this.log('Claude invocation failed', { error })
+      this.log('Claude CLI invocation failed', { error })
       throw error
     }
   }
@@ -148,54 +152,54 @@ export class ClaudeIntegration {
    */
   private async executeConversationTurn(
     systemPrompt: string,
-    messages: MessageParam[],
-    tools: Tool[],
+    conversationText: string,
+    tools: Array<{ name: string; description: string; input_schema: any }>,
     toolExecutor: ToolExecutor
   ): Promise<string> {
-    const conversationMessages = [...messages]
-    let continueLoop = true
+    let currentPrompt = conversationText
     let finalText = ''
+    let continueLoop = true
+    let iterationCount = 0
+    const maxIterations = 10 // Prevent infinite loops
 
-    while (continueLoop) {
-      // Call Claude API
-      const response = await this.callClaudeAPI(
+    while (continueLoop && iterationCount < maxIterations) {
+      iterationCount++
+
+      // Call Claude CLI subprocess
+      const response = await this.callClaudeCLI({
         systemPrompt,
-        conversationMessages,
-        tools
-      )
-
-      this.log('Claude response', {
-        stopReason: response.stopReason,
-        hasText: response.text.length > 0,
-        toolCallCount: response.toolCalls.length,
+        userPrompt: currentPrompt,
+        tools: tools.length > 0 ? tools : undefined,
+        timeout: this.timeout,
       })
 
+      this.log('Claude CLI response', {
+        iteration: iterationCount,
+        responseLength: response.length,
+      })
+
+      // Parse the response to extract text and potential tool calls
+      const parsed = this.parseResponse(response)
+
       // Accumulate text
-      if (response.text) {
-        finalText += response.text
+      if (parsed.text) {
+        finalText += parsed.text
       }
 
       // Check if there are tool calls to execute
-      if (response.toolCalls.length > 0) {
-        // Add assistant's response to conversation
-        conversationMessages.push({
-          role: 'assistant',
-          content: this.buildContentBlocks(response),
-        })
-
+      if (parsed.toolCalls.length > 0) {
         // Execute all tool calls
         const toolResults = await this.executeToolCalls(
-          response.toolCalls,
+          parsed.toolCalls,
           toolExecutor
         )
 
-        // Add tool results to conversation
-        conversationMessages.push({
-          role: 'user',
-          content: toolResults,
-        })
+        // Format tool results as new user message
+        const toolResultsText = this.formatToolResults(toolResults)
 
-        // Continue the loop to get Claude's next response
+        // Continue conversation with tool results
+        currentPrompt = `Previous response:\n${response}\n\nTool results:\n${toolResultsText}\n\nPlease continue based on these tool results.`
+
         continueLoop = true
       } else {
         // No tool calls, conversation turn is complete
@@ -203,26 +207,120 @@ export class ClaudeIntegration {
       }
     }
 
+    if (iterationCount >= maxIterations) {
+      this.log('Warning: Max iterations reached')
+    }
+
     return finalText
   }
 
   /**
-   * Call Claude API and parse response
+   * Call Claude CLI subprocess and capture output
    */
-  private async callClaudeAPI(
-    systemPrompt: string,
-    messages: MessageParam[],
-    tools: Tool[]
-  ): Promise<ClaudeResponse> {
-    const response = await this.client.messages.create({
-      model: this.model,
-      max_tokens: this.maxTokens,
-      system: systemPrompt,
-      messages,
-      tools: tools.length > 0 ? tools : undefined,
-    })
+  private async callClaudeCLI(options: CLIProcessOptions): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const args: string[] = []
 
-    return this.parseResponse(response)
+      // Build the prompt
+      let fullPrompt = ''
+
+      if (options.systemPrompt) {
+        fullPrompt += `System: ${options.systemPrompt}\n\n`
+      }
+
+      fullPrompt += options.userPrompt
+
+      // Add tool definitions if provided
+      if (options.tools && options.tools.length > 0) {
+        fullPrompt += '\n\nAvailable tools:\n'
+        fullPrompt += JSON.stringify(options.tools, null, 2)
+        fullPrompt += '\n\nYou can use these tools by responding with a tool call in this format:\n'
+        fullPrompt += '```tool_call\n{\n  "tool": "tool_name",\n  "id": "unique_id",\n  "input": {...}\n}\n```'
+      }
+
+      this.log('Spawning Claude CLI process', {
+        command: this.claudePath,
+        args,
+        promptLength: fullPrompt.length,
+      })
+
+      // Spawn the Claude CLI process
+      const claudeProcess: ChildProcess = spawn(this.claudePath, args, {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env },
+      })
+
+      let stdout = ''
+      let stderr = ''
+
+      // Capture stdout
+      if (claudeProcess.stdout) {
+        claudeProcess.stdout.on('data', (data) => {
+          const chunk = data.toString()
+          stdout += chunk
+          if (this.debug) {
+            this.log('CLI stdout chunk', { length: chunk.length })
+          }
+        })
+      }
+
+      // Capture stderr
+      if (claudeProcess.stderr) {
+        claudeProcess.stderr.on('data', (data) => {
+          stderr += data.toString()
+        })
+      }
+
+      // Handle process completion
+      claudeProcess.on('close', (code) => {
+        this.log('CLI process closed', { code, stdoutLength: stdout.length, stderrLength: stderr.length })
+
+        if (code === 0) {
+          resolve(stdout)
+        } else {
+          reject(
+            new Error(
+              `Claude CLI exited with code ${code}\nStderr: ${stderr}\nStdout: ${stdout}`
+            )
+          )
+        }
+      })
+
+      // Handle process errors
+      claudeProcess.on('error', (error) => {
+        this.log('CLI process error', { error })
+        reject(
+          new Error(
+            `Failed to spawn Claude CLI: ${error.message}\nIs Claude CLI installed and in PATH?`
+          )
+        )
+      })
+
+      // Setup timeout
+      const timeoutId = setTimeout(() => {
+        claudeProcess.kill('SIGTERM')
+        reject(new Error('Claude CLI process timeout'))
+      }, options.timeout || this.timeout)
+
+      // Send the prompt via stdin
+      if (claudeProcess.stdin) {
+        try {
+          claudeProcess.stdin.write(fullPrompt)
+          claudeProcess.stdin.end()
+        } catch (error) {
+          clearTimeout(timeoutId)
+          reject(error)
+        }
+      } else {
+        clearTimeout(timeoutId)
+        reject(new Error('Failed to write to Claude CLI stdin'))
+      }
+
+      // Clear timeout when process completes
+      claudeProcess.on('close', () => {
+        clearTimeout(timeoutId)
+      })
+    })
   }
 
   /**
@@ -231,12 +329,14 @@ export class ClaudeIntegration {
   private async executeToolCalls(
     toolCalls: Array<{ id: string; name: string; input: any }>,
     toolExecutor: ToolExecutor
-  ): Promise<Array<{ type: 'tool_result'; tool_use_id: string; content: string }>> {
-    const results: Array<{
-      type: 'tool_result'
-      tool_use_id: string
-      content: string
-    }> = []
+  ): Promise<
+    Array<{
+      id: string
+      name: string
+      result: string
+    }>
+  > {
+    const results: Array<{ id: string; name: string; result: string }> = []
 
     for (const toolCall of toolCalls) {
       this.log(`Executing tool: ${toolCall.name}`, { input: toolCall.input })
@@ -252,9 +352,9 @@ export class ClaudeIntegration {
         const resultString = this.formatToolResult(toolResult)
 
         results.push({
-          type: 'tool_result',
-          tool_use_id: toolCall.id,
-          content: resultString,
+          id: toolCall.id,
+          name: toolCall.name,
+          result: resultString,
         })
       } catch (error) {
         // Return error as tool result
@@ -262,9 +362,9 @@ export class ClaudeIntegration {
           error instanceof Error ? error.message : String(error)
 
         results.push({
-          type: 'tool_result',
-          tool_use_id: toolCall.id,
-          content: `Error executing tool: ${errorMessage}`,
+          id: toolCall.id,
+          name: toolCall.name,
+          result: `Error executing tool: ${errorMessage}`,
         })
       }
     }
@@ -273,76 +373,75 @@ export class ClaudeIntegration {
   }
 
   /**
-   * Parse Anthropic API response into our format
+   * Parse Claude CLI response to extract text and tool calls
+   *
+   * This is a simple parser that looks for tool call markers in the response.
+   * In a production implementation, this would need to be more sophisticated
+   * and handle the actual format that Claude CLI uses for tool calls.
    */
-  private parseResponse(response: AnthropicMessage): ClaudeResponse {
+  private parseResponse(response: string): ClaudeResponse {
     const toolCalls: Array<{ id: string; name: string; input: any }> = []
-    let text = ''
+    let text = response
 
-    // Extract text and tool calls from content blocks
-    for (const block of response.content) {
-      if (block.type === 'text') {
-        text += block.text
-      } else if (block.type === 'tool_use') {
+    // Look for tool call blocks (this is a simplified parser)
+    // Format: ```tool_call\n{json}\n```
+    const toolCallRegex = /```tool_call\s*\n([\s\S]*?)\n```/g
+    let match
+
+    while ((match = toolCallRegex.exec(response)) !== null) {
+      try {
+        const toolCallJson = match[1]
+        const toolCall = JSON.parse(toolCallJson)
+
         toolCalls.push({
-          id: block.id,
-          name: block.name,
-          input: block.input,
+          id: toolCall.id || `tool_${Date.now()}_${toolCalls.length}`,
+          name: toolCall.tool || toolCall.name,
+          input: toolCall.input || {},
         })
+
+        // Remove the tool call block from the text
+        text = text.replace(match[0], '')
+      } catch (error) {
+        this.log('Failed to parse tool call', { error, match: match[1] })
       }
     }
 
+    // Determine stop reason
+    let stopReason: ClaudeResponse['stopReason'] = 'end_turn'
+    if (toolCalls.length > 0) {
+      stopReason = 'tool_use'
+    }
+
     return {
-      text,
+      text: text.trim(),
       toolCalls,
-      stopReason: response.stop_reason as any,
+      stopReason,
     }
   }
 
   /**
-   * Build content blocks for assistant message (text + tool calls)
+   * Format messages into a single conversation string
    */
-  private buildContentBlocks(
-    response: ClaudeResponse
-  ): Array<ContentBlock> {
-    const blocks: Array<ContentBlock> = []
+  private formatMessages(messages: Message[]): string {
+    return messages
+      .map((msg) => {
+        const content =
+          typeof msg.content === 'string'
+            ? msg.content
+            : JSON.stringify(msg.content)
 
-    // Add text block if present
-    if (response.text) {
-      blocks.push({
-        type: 'text',
-        text: response.text,
-      } as ContentBlock)
-    }
-
-    // Add tool use blocks
-    for (const toolCall of response.toolCalls) {
-      blocks.push({
-        type: 'tool_use',
-        id: toolCall.id,
-        name: toolCall.name,
-        input: toolCall.input,
-      } as ContentBlock)
-    }
-
-    return blocks
+        if (msg.role === 'user') {
+          return `User: ${content}`
+        } else if (msg.role === 'assistant') {
+          return `Assistant: ${content}`
+        }
+        return content
+      })
+      .join('\n\n')
   }
 
   /**
-   * Convert Codebuff messages to Anthropic format
-   */
-  private convertMessages(messages: Message[]): MessageParam[] {
-    return messages.map((msg) => ({
-      role: msg.role === 'assistant' ? 'assistant' : 'user',
-      content:
-        typeof msg.content === 'string'
-          ? msg.content
-          : JSON.stringify(msg.content),
-    }))
-  }
-
-  /**
-   * Format tool result for Claude
+   * Format tool results for Claude
    */
   private formatToolResult(results: ToolResultOutput[]): string {
     if (results.length === 0) {
@@ -366,18 +465,43 @@ export class ClaudeIntegration {
   }
 
   /**
-   * Build tool definitions for Claude API
+   * Format tool results for inclusion in the next prompt
    */
-  private buildToolDefinitions(toolNames: string[]): Tool[] {
-    return toolNames.map((name) => this.getToolDefinition(name)).filter(Boolean) as Tool[]
+  private formatToolResults(
+    results: Array<{ id: string; name: string; result: string }>
+  ): string {
+    return results
+      .map(
+        (result) =>
+          `Tool: ${result.name} (ID: ${result.id})\nResult:\n${result.result}`
+      )
+      .join('\n\n')
+  }
+
+  /**
+   * Build tool definitions for Claude CLI
+   */
+  private buildToolDefinitions(
+    toolNames: string[]
+  ): Array<{ name: string; description: string; input_schema: any }> {
+    return toolNames
+      .map((name) => this.getToolDefinition(name))
+      .filter(Boolean) as Array<{
+      name: string
+      description: string
+      input_schema: any
+    }>
   }
 
   /**
    * Get tool definition for a specific tool name
+   * (Same definitions as the API version, but formatted for CLI)
    */
-  private getToolDefinition(toolName: string): Tool | null {
-    // Cast to any for the switch - we're building Claude API Tool definitions,
-    // not enforcing Codebuff's ToolName type here
+  private getToolDefinition(toolName: string): {
+    name: string
+    description: string
+    input_schema: any
+  } | null {
     switch (toolName as any) {
       case 'read_files':
         return {
@@ -573,7 +697,8 @@ export class ClaudeIntegration {
             type: 'object',
             properties: {
               output: {
-                description: 'The output value to set (any JSON-serializable value)',
+                description:
+                  'The output value to set (any JSON-serializable value)',
               },
             },
             required: ['output'],
@@ -591,9 +716,9 @@ export class ClaudeIntegration {
    */
   private log(message: string, data?: any): void {
     if (this.debug) {
-      const prefix = '[ClaudeIntegration]'
+      const prefix = '[ClaudeCLIIntegration]'
       if (data !== undefined) {
-        this.logger(`${prefix} ${message}: ${JSON.stringify(data)}`)
+        this.logger(`${prefix} ${message}:`, data)
       } else {
         this.logger(`${prefix} ${message}`)
       }

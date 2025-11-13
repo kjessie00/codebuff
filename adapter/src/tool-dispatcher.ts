@@ -10,7 +10,8 @@
  * @module tool-dispatcher
  */
 
-import type { ToolCall, ToolResultOutput } from '../../.agents/types/util-types'
+import type { ToolResultOutput } from '../../.agents/types/util-types'
+import type { ToolCall } from '../../.agents/types/agent-definition'
 import type { AgentExecutionContext } from './types'
 import { FileOperationsTools } from './tools/file-operations'
 import { CodeSearchTools } from './tools/code-search'

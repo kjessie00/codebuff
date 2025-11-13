@@ -467,7 +467,7 @@ export class LLMExecutor {
       runId: this.generateId(),
       parentId: context.parentId,
       messageHistory: context.messageHistory,
-      output: context.output,
+      output: context.output as Record<string, any> | undefined,
     }
   }
 
