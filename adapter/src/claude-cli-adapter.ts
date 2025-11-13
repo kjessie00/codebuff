@@ -27,7 +27,32 @@ import { CodeSearchTools } from './tools/code-search'
 import { TerminalTools } from './tools/terminal'
 import { SpawnAgentsAdapter } from './tools/spawn-agents'
 
-import type { AdapterConfig, AgentExecutionContext } from './types'
+import type {
+  AdapterConfig,
+  AgentExecutionContext,
+  ReadFilesParams,
+  WriteFileParams,
+  StrReplaceParams,
+  CodeSearchInput,
+  FindFilesInput,
+  RunTerminalCommandInput,
+  SpawnAgentsParams,
+  SetOutputParams,
+  RetryConfig,
+  TimeoutConfig,
+} from './types'
+
+import {
+  AdapterError,
+  ToolExecutionError,
+  LLMExecutionError,
+  ValidationError,
+  AgentNotFoundError,
+  formatError,
+  isAdapterError,
+} from './errors'
+
+import { withTimeout } from './utils/async-utils'
 
 // ============================================================================
 // Type Definitions
@@ -38,7 +63,7 @@ import type { AdapterConfig, AgentExecutionContext } from './types'
  */
 export interface AgentExecutionResult {
   /** The output value from the agent */
-  output: any
+  output: unknown
   /** Complete message history from the agent execution */
   messageHistory: Message[]
   /** Final agent state */
@@ -130,6 +155,18 @@ export class ClaudeCodeCLIAdapter {
       maxSteps: config.maxSteps ?? 20,
       debug: config.debug ?? false,
       logger: config.logger ?? this.defaultLogger,
+      retry: config.retry ?? {
+        maxRetries: 3,
+        initialDelayMs: 1000,
+        maxDelayMs: 10000,
+        backoffMultiplier: 2,
+        exponentialBackoff: true,
+      },
+      timeouts: config.timeouts ?? {
+        toolExecutionTimeoutMs: 30000,
+        llmInvocationTimeoutMs: 60000,
+        terminalCommandTimeoutMs: 30000,
+      },
     }
 
     // Initialize tool implementations
@@ -230,6 +267,8 @@ export class ClaudeCodeCLIAdapter {
    * @param params - Optional parameters for the agent
    * @param parentContext - Optional parent execution context for nested agents
    * @returns Promise resolving to execution result
+   * @throws {MaxIterationsError} If execution exceeds maxSteps configuration
+   * @throws {Error} If agent execution fails or tool execution errors
    *
    * @example
    * ```typescript
@@ -243,7 +282,7 @@ export class ClaudeCodeCLIAdapter {
   async executeAgent(
     agentDef: AgentDefinition,
     prompt: string | undefined,
-    params?: Record<string, any>,
+    params?: Record<string, unknown>,
     parentContext?: AgentExecutionContext
   ): Promise<AgentExecutionResult> {
     const startTime = Date.now()
@@ -320,7 +359,7 @@ export class ClaudeCodeCLIAdapter {
   private async executeWithHandleSteps(
     agentDef: AgentDefinition,
     prompt: string | undefined,
-    params: Record<string, any> | undefined,
+    params: Record<string, unknown> | undefined,
     context: AgentExecutionContext
   ): Promise<AgentExecutionResult> {
     this.log('Executing with handleSteps generator')
@@ -331,7 +370,7 @@ export class ClaudeCodeCLIAdapter {
       runId: this.generateId(),
       parentId: context.parentId,
       messageHistory: context.messageHistory,
-      output: context.output,
+      output: context.output as Record<string, any> | undefined,
     }
 
     // Create step context
@@ -506,6 +545,7 @@ export class ClaudeCodeCLIAdapter {
    * @param context - Execution context
    * @param toolCall - Tool call to execute
    * @returns Promise resolving to tool result
+   * @throws {Error} If tool name is unknown or tool execution fails
    */
   private async executeToolCall(
     context: AgentExecutionContext,
@@ -562,72 +602,75 @@ export class ClaudeCodeCLIAdapter {
   /**
    * read_files tool - Read multiple files from disk
    */
-  private async toolReadFiles(input: any): Promise<ToolResultOutput[]> {
-    return await this.fileOps.readFiles(input)
+  private async toolReadFiles(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.fileOps.readFiles(input as ReadFilesParams)
   }
 
   /**
    * write_file tool - Write content to a file
    */
-  private async toolWriteFile(input: any): Promise<ToolResultOutput[]> {
-    return await this.fileOps.writeFile(input)
+  private async toolWriteFile(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.fileOps.writeFile(input as WriteFileParams)
   }
 
   /**
    * str_replace tool - Replace string in a file
    */
-  private async toolStrReplace(input: any): Promise<ToolResultOutput[]> {
-    return await this.fileOps.strReplace(input)
+  private async toolStrReplace(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.fileOps.strReplace(input as StrReplaceParams)
   }
 
   /**
    * code_search tool - Search codebase with ripgrep
    */
-  private async toolCodeSearch(input: any): Promise<ToolResultOutput[]> {
-    return await this.codeSearch.codeSearch(input)
+  private async toolCodeSearch(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.codeSearch.codeSearch(input as CodeSearchInput)
   }
 
   /**
    * find_files tool - Find files matching glob pattern
    */
-  private async toolFindFiles(input: any): Promise<ToolResultOutput[]> {
-    return await this.codeSearch.findFiles(input)
+  private async toolFindFiles(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.codeSearch.findFiles(input as FindFilesInput)
   }
 
   /**
    * run_terminal_command tool - Execute shell command
    */
-  private async toolRunTerminal(input: any): Promise<ToolResultOutput[]> {
-    return await this.terminal.runTerminalCommand(input)
+  private async toolRunTerminal(input: unknown): Promise<ToolResultOutput[]> {
+    return await this.terminal.runTerminalCommand(input as RunTerminalCommandInput)
   }
 
   /**
    * spawn_agents tool - Spawn and execute sub-agents
    */
   private async toolSpawnAgents(
-    input: any,
+    input: unknown,
     context: AgentExecutionContext
   ): Promise<ToolResultOutput[]> {
-    return await this.spawnAgents.spawnAgents(input, context)
+    return await this.spawnAgents.spawnAgents(input as SpawnAgentsParams, context)
   }
 
   /**
    * set_output tool - Set agent output value
    */
   private async toolSetOutput(
-    input: any,
+    input: unknown,
     context: AgentExecutionContext
   ): Promise<ToolResultOutput[]> {
+    // Extract output from input (handle both agent and adapter formats)
+    const outputValue = (input as { output?: unknown })?.output ?? input
+
     // Update context output
-    context.output = input.output
+    context.output = outputValue as Record<string, any> | undefined
 
     return [
       {
         type: 'json',
         value: {
           success: true,
-          output: input.output,
-        },
+          output: outputValue as any,
+        } as any,
       },
     ]
   }
@@ -696,7 +739,7 @@ export class ClaudeCodeCLIAdapter {
       runId: this.generateId(),
       parentId: context.parentId,
       messageHistory: context.messageHistory,
-      output: context.output,
+      output: context.output as Record<string, any> | undefined,
     }
   }
 
@@ -731,7 +774,7 @@ export class ClaudeCodeCLIAdapter {
     agentDef: AgentDefinition,
     context: AgentExecutionContext,
     lastResponse: string
-  ): any {
+  ): unknown {
     const outputMode = agentDef.outputMode ?? 'last_message'
 
     switch (outputMode) {

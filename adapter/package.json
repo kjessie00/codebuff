@@ -20,6 +20,8 @@
   "author": "Codebuff",
   "license": "MIT",
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.68.0",
+    "ai": "^5.0.93",
     "glob": "^11.0.0"
   },
   "devDependencies": {

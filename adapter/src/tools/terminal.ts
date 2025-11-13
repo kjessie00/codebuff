@@ -10,12 +10,17 @@
  * @module terminal
  */
 
-import { exec, spawn } from 'child_process'
+import { spawn } from 'child_process'
 import { promisify } from 'util'
 import * as path from 'path'
 import type { ToolResultOutput } from '../../../.agents/types/util-types'
-
-const execAsync = promisify(exec)
+import type { RetryConfig } from '../types'
+import { ToolExecutionError, ValidationError, TimeoutError } from '../errors'
+import {
+  withRetry,
+  isTransientError,
+  DEFAULT_RETRY_CONFIG,
+} from '../utils/async-utils'
 
 /**
  * Parameters for terminal command execution
@@ -41,6 +46,12 @@ export interface RunTerminalCommandInput {
 
   /** Describe what the command does (for logging) */
   description?: string
+
+  /** Whether to retry on transient failures (default: false) */
+  retry?: boolean
+
+  /** Retry configuration (only used if retry is true) */
+  retryConfig?: Partial<RetryConfig>
 }
 
 /**
@@ -73,22 +84,142 @@ export interface CommandExecutionResult {
 }
 
 /**
+ * Parsed command structure
+ */
+interface ParsedCommand {
+  /** The executable/command name */
+  command: string
+  /** Array of command arguments */
+  args: string[]
+}
+
+/**
+ * Sanitize input to prevent command injection
+ *
+ * Validates that input doesn't contain dangerous shell metacharacters
+ * that could be used for command injection attacks.
+ *
+ * @param input - String to validate
+ * @param fieldName - Name of the field being validated (for error messages)
+ * @throws Error if input contains dangerous characters
+ *
+ * @security This prevents shell injection by rejecting common shell metacharacters
+ * including: semicolons, pipes, redirects, backticks, command substitution, etc.
+ */
+function sanitizeInput(input: string, fieldName: string = 'input'): void {
+  // Dangerous characters that could enable command injection
+  // These allow chaining commands, substitution, or other shell features
+  const dangerousChars = /[;&|`$()<>]/
+
+  if (dangerousChars.test(input)) {
+    throw new Error(
+      `Invalid ${fieldName}: contains dangerous characters. ` +
+      `Detected potentially malicious input that could lead to command injection.`
+    )
+  }
+}
+
+/**
+ * Parse a command string into command and arguments
+ *
+ * Uses basic shell-like parsing to split command into executable and arguments.
+ * Handles quoted strings (single and double quotes) to allow spaces in arguments.
+ *
+ * @param commandStr - Command string to parse (e.g., "git commit -m 'message'")
+ * @returns Parsed command with executable and arguments array
+ *
+ * @security This parsing ensures commands are passed to spawn() with separate
+ * arguments instead of being interpreted by a shell, preventing injection attacks.
+ *
+ * @example
+ * parseCommand('git status') // { command: 'git', args: ['status'] }
+ * parseCommand('git commit -m "hello"') // { command: 'git', args: ['commit', '-m', 'hello'] }
+ */
+function parseCommand(commandStr: string): ParsedCommand {
+  const parts: string[] = []
+  let current = ''
+  let inQuote: string | null = null
+
+  for (let i = 0; i < commandStr.length; i++) {
+    const char = commandStr[i]
+
+    // Handle quotes
+    if ((char === '"' || char === "'") && commandStr[i - 1] !== '\\') {
+      if (inQuote === char) {
+        // Closing quote
+        inQuote = null
+      } else if (inQuote === null) {
+        // Opening quote
+        inQuote = char
+      } else {
+        // Quote of different type inside quoted string
+        current += char
+      }
+      continue
+    }
+
+    // Handle whitespace (token separator when not in quotes)
+    if (/\s/.test(char) && inQuote === null) {
+      if (current) {
+        parts.push(current)
+        current = ''
+      }
+      continue
+    }
+
+    // Regular character
+    current += char
+  }
+
+  // Add final token
+  if (current) {
+    parts.push(current)
+  }
+
+  if (parts.length === 0) {
+    throw new Error('Empty command string')
+  }
+
+  return {
+    command: parts[0],
+    args: parts.slice(1)
+  }
+}
+
+/**
  * Terminal Tools implementation
  *
  * Provides command execution capabilities that map to Claude Code CLI's Bash tool.
  * Executes shell commands with proper error handling, timeouts, and output capture.
+ * Supports retry logic with exponential backoff for transient failures.
  */
 export class TerminalTools {
+  /** Cache for merged environment variables to avoid repeated object merging */
+  private mergedEnvCache: Record<string, string> | null = null
+
+  /** Cache for normalized CWD path to avoid repeated path operations */
+  private normalizedCwdCache: string | null = null
+
+  /** Default retry configuration */
+  private readonly defaultRetryConfig: RetryConfig
+
   /**
    * Create a new TerminalTools instance
    *
    * @param cwd - Current working directory for command execution
    * @param env - Optional environment variables to merge with process.env
+   * @param retryConfig - Optional default retry configuration
    */
   constructor(
     private readonly cwd: string,
-    private readonly env?: Record<string, string>
-  ) {}
+    private readonly env?: Record<string, string>,
+    retryConfig?: Partial<RetryConfig>
+  ) {
+    this.defaultRetryConfig = {
+      ...DEFAULT_RETRY_CONFIG,
+      ...retryConfig,
+    }
+  }
 
   /**
    * Execute a shell command
@@ -147,13 +278,21 @@ export class TerminalTools {
         ? input.timeout_seconds * 1000
         : 30000 // Default 30 seconds
 
-      // Execute the command
-      const result = await this.executeCommand(
-        input.command,
-        execCwd,
-        timeoutMs,
-        input.env
-      )
+      // Execute the command with optional retry logic
+      const result = input.retry
+        ? await this.executeCommandWithRetry(
+            input.command,
+            execCwd,
+            timeoutMs,
+            input.env,
+            input.retryConfig
+          )
+        : await this.executeCommand(
+            input.command,
+            execCwd,
+            timeoutMs,
+            input.env
+          )
 
       // Calculate execution time
       const executionTime = Date.now() - startTime
@@ -180,15 +319,26 @@ export class TerminalTools {
     } catch (error) {
       const executionTime = Date.now() - startTime
 
+      // Wrap error in ToolExecutionError for better context
+      const wrappedError = new ToolExecutionError(
+        `Terminal command failed: ${this.formatError(error)}`,
+        {
+          toolName: 'run_terminal_command',
+          toolInput: input,
+          originalError: error instanceof Error ? error : new Error(String(error)),
+        }
+      )
+
       // Handle execution errors
       return [
         {
           type: 'json',
           value: {
-            output: this.formatErrorOutput(input.command, error, executionTime),
+            output: this.formatErrorOutput(input.command, wrappedError, executionTime),
             command: input.command,
             executionTime,
             error: true,
+            errorDetails: wrappedError.toJSON(),
           },
         },
       ]
@@ -271,20 +421,47 @@ export class TerminalTools {
   /**
    * Get environment variables available in the terminal
    *
+   * Performance: Returns cached merged environment to avoid repeated object spreading.
+   *
    * @returns Object containing all environment variables
    */
   getEnvironmentVariables(): Record<string, string> {
-    return {
-      ...process.env,
-      ...this.env,
-    } as Record<string, string>
+    // Use cached merged environment to avoid repeated object spreading
+    if (!this.mergedEnvCache) {
+      this.mergedEnvCache = {
+        ...process.env,
+        ...this.env,
+      } as Record<string, string>
+    }
+    return this.mergedEnvCache
+  }
+
+  /**
+   * Invalidate environment variable cache
+   * Call this if process.env is modified after initialization
+   */
+  invalidateEnvCache(): void {
+    this.mergedEnvCache = null
+  }
+
+  /**
+   * Invalidate CWD cache
+   * Call this if the base CWD needs to be changed
+   */
+  invalidateCwdCache(): void {
+    this.normalizedCwdCache = null
   }
 
   /**
    * Verify a command is available on the system
    *
+   * Uses secure command execution to check if a command exists without
+   * exposing to command injection vulnerabilities.
+   *
    * @param command - Command name to check (e.g., 'git', 'npm')
    * @returns True if command is available, false otherwise
+   *
+   * @security Validates command name before execution to prevent injection
    *
    * @example
    * ```typescript
@@ -296,13 +473,53 @@ export class TerminalTools {
    */
   async verifyCommand(command: string): Promise<boolean> {
     try {
-      const checkCommand =
-        process.platform === 'win32'
-          ? `where ${command}`
-          : `command -v ${command}`
+      // Validate command name to prevent injection
+      sanitizeInput(command, 'command')
 
-      await execAsync(checkCommand, { timeout: 5000 })
-      return true
+      // Use spawn instead of exec for security
+      if (process.platform === 'win32') {
+        const result = await this.executeCommand('where', this.cwd, 5000)
+        // Add command as separate argument
+        const child = spawn('where', [command], {
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+
+        return new Promise((resolve) => {
+          child.on('close', (code) => {
+            resolve(code === 0)
+          })
+          child.on('error', () => {
+            resolve(false)
+          })
+
+          // Timeout after 5 seconds
+          setTimeout(() => {
+            child.kill()
+            resolve(false)
+          }, 5000)
+        })
+      } else {
+        const child = spawn('command', ['-v', command], {
+          shell: false,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        })
+
+        return new Promise((resolve) => {
+          child.on('close', (code) => {
+            resolve(code === 0)
+          })
+          child.on('error', () => {
+            resolve(false)
+          })
+
+          // Timeout after 5 seconds
+          setTimeout(() => {
+            child.kill()
+            resolve(false)
+          }, 5000)
+        })
+      }
     } catch {
       return false
     }
@@ -311,9 +528,13 @@ export class TerminalTools {
   /**
    * Get the version of a command if available
    *
+   * Executes the command with version flag using secure spawn-based execution.
+   *
    * @param command - Command name
    * @param versionFlag - Flag to use for version (default: '--version')
    * @returns Version string or null if not available
+   *
+   * @security Validates inputs and uses spawn() to prevent injection
    *
    * @example
    * ```typescript
@@ -326,10 +547,40 @@ export class TerminalTools {
     versionFlag: string = '--version'
   ): Promise<string | null> {
     try {
-      const { stdout } = await execAsync(`${command} ${versionFlag}`, {
-        timeout: 5000,
+      // Validate inputs to prevent injection
+      sanitizeInput(command, 'command')
+      sanitizeInput(versionFlag, 'versionFlag')
+
+      const child = spawn(command, [versionFlag], {
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
       })
-      return stdout.trim().split('\n')[0]
+
+      return new Promise((resolve) => {
+        let stdout = ''
+
+        child.stdout?.on('data', (data: Buffer) => {
+          stdout += data.toString('utf-8')
+        })
+
+        child.on('close', (code) => {
+          if (code === 0 && stdout) {
+            resolve(stdout.trim().split('\n')[0])
+          } else {
+            resolve(null)
+          }
+        })
+
+        child.on('error', () => {
+          resolve(null)
+        })
+
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          child.kill()
+          resolve(null)
+        }, 5000)
+      })
     } catch {
       return null
     }
@@ -340,13 +591,110 @@ export class TerminalTools {
   // ============================================================================
 
   /**
-   * Execute a command using Node.js child_process
+   * Get cached normalized CWD
+   *
+   * Performance: Caches normalized CWD to avoid repeated path.normalize() calls.
+   *
+   * @returns Normalized CWD path
+   */
+  private getNormalizedCwd(): string {
+    if (!this.normalizedCwdCache) {
+      this.normalizedCwdCache = path.normalize(this.cwd)
+    }
+    return this.normalizedCwdCache
+  }
+
+  /**
+   * Execute a command with retry logic and exponential backoff
+   *
+   * Wraps executeCommand with retry logic for transient failures.
+   * Automatically retries on timeout and network errors.
+   *
+   * @param command - Command string to execute
+   * @param cwd - Working directory
+   * @param timeout - Timeout in milliseconds per attempt
+   * @param customEnv - Optional environment variables to merge
+   * @param retryConfig - Optional retry configuration override
+   * @returns Command output
+   *
+   * @throws {ToolExecutionError} If all retry attempts are exhausted
+   *
+   * @example
+   * ```typescript
+   * const result = await this.executeCommandWithRetry(
+   *   'npm install',
+   *   '/path/to/project',
+   *   30000,
+   *   undefined,
+   *   { maxRetries: 3, exponentialBackoff: true }
+   * )
+   * ```
+   */
+  private async executeCommandWithRetry(
+    command: string,
+    cwd: string,
+    timeout: number,
+    customEnv?: Record<string, string>,
+    retryConfig?: Partial<RetryConfig>
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    // Merge retry config with defaults
+    const config = {
+      ...this.defaultRetryConfig,
+      ...retryConfig,
+    }
+
+    // Track retry attempts for logging
+    let attemptNumber = 0
+
+    return withRetry(
+      () => this.executeCommand(command, cwd, timeout, customEnv),
+      {
+        maxRetries: config.maxRetries,
+        initialDelayMs: config.initialDelayMs,
+        maxDelayMs: config.maxDelayMs,
+        backoffMultiplier: config.backoffMultiplier,
+        exponentialBackoff: config.exponentialBackoff,
+        shouldRetry: (error: unknown) => {
+          // Only retry on transient errors (timeout, network issues)
+          return isTransientError(error)
+        },
+        onRetry: (error: unknown, attempt: number, delayMs: number) => {
+          attemptNumber = attempt
+          // Log retry attempt (could integrate with adapter's logger)
+          console.warn(
+            `[TerminalTools] Retrying command "${command}" ` +
+              `(attempt ${attempt}/${config.maxRetries}) ` +
+              `after ${delayMs}ms delay. ` +
+              `Reason: ${this.formatError(error)}`
+          )
+        },
+        operation: 'terminal_command',
+      }
+    )
+  }
+
+  /**
+   * Execute a command using Node.js child_process.spawn
+   *
+   * Uses spawn() instead of exec() to avoid shell interpretation and prevent
+   * command injection vulnerabilities. The command is parsed into executable
+   * and arguments, which are passed separately to spawn().
+   *
+   * Performance: Uses cached merged environment variables when no custom env is provided.
    *
    * @param command - Command string to execute
    * @param cwd - Working directory
    * @param timeout - Timeout in milliseconds
    * @param customEnv - Optional environment variables to merge
    * @returns Command output
+   *
+   * @security This method:
+   * 1. Parses commands to separate executable from arguments
+   * 2. Uses spawn() with shell: false to prevent shell interpretation
+   * 3. Passes arguments as array to avoid injection via concatenation
+   * 4. Implements timeout to prevent hanging processes
+   *
+   * @throws Error if command contains dangerous characters or fails to execute
    */
   private async executeCommand(
     command: string,
@@ -354,39 +702,104 @@ export class TerminalTools {
     timeout: number,
     customEnv?: Record<string, string>
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
-    // Merge environment variables
-    const env = {
-      ...process.env,
-      ...this.env,
-      ...customEnv,
-    }
+    // Parse command into executable and arguments
+    // This separates the command from its args, preventing shell injection
+    const parsed = parseCommand(command)
 
-    try {
-      // Use exec for simple command execution
-      const { stdout, stderr } = await execAsync(command, {
+    // Validate the command executable doesn't contain dangerous characters
+    // Note: We're more lenient with args since they won't be shell-interpreted
+    sanitizeInput(parsed.command, 'command')
+
+    // Merge environment variables (use cache when no custom env)
+    const env = customEnv
+      ? {
+          ...this.getEnvironmentVariables(),
+          ...customEnv,
+        }
+      : this.getEnvironmentVariables()
+
+    return new Promise((resolve, reject) => {
+      // Use spawn instead of exec to avoid shell interpretation
+      // shell: false is critical - it prevents command injection
+      const child = spawn(parsed.command, parsed.args, {
         cwd,
         env,
-        timeout,
-        maxBuffer: 10 * 1024 * 1024, // 10MB buffer for large outputs
-        encoding: 'utf-8',
+        shell: false, // SECURITY: Never set to true - prevents shell injection
+        stdio: ['ignore', 'pipe', 'pipe'], // stdin ignored, stdout/stderr piped
       })
 
-      return {
-        stdout,
-        stderr,
-        exitCode: 0,
+      let stdout = ''
+      let stderr = ''
+      let timedOut = false
+      let timeoutHandle: NodeJS.Timeout | null = null
+
+      // Set up timeout
+      if (timeout > 0) {
+        timeoutHandle = setTimeout(() => {
+          timedOut = true
+          child.kill('SIGTERM')
+
+          // Force kill after 5 seconds if SIGTERM doesn't work
+          setTimeout(() => {
+            if (!child.killed) {
+              child.kill('SIGKILL')
+            }
+          }, 5000)
+        }, timeout)
       }
-    } catch (error: any) {
-      // exec throws on non-zero exit codes, but we still want the output
-      if (error.code !== undefined && error.stdout !== undefined) {
-        return {
-          stdout: error.stdout || '',
-          stderr: error.stderr || '',
-          exitCode: error.code,
+
+      // Collect stdout
+      child.stdout?.on('data', (data: Buffer) => {
+        stdout += data.toString('utf-8')
+      })
+
+      // Collect stderr
+      child.stderr?.on('data', (data: Buffer) => {
+        stderr += data.toString('utf-8')
+      })
+
+      // Handle process exit
+      child.on('close', (code: number | null, signal: string | null) => {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle)
         }
-      }
-      throw error
-    }
+
+        if (timedOut) {
+          reject(
+            Object.assign(
+              new Error(`Command timed out after ${timeout}ms`),
+              {
+                code: -1,
+                stdout,
+                stderr,
+                killed: true,
+              }
+            )
+          )
+          return
+        }
+
+        resolve({
+          stdout,
+          stderr,
+          exitCode: code ?? -1,
+        })
+      })
+
+      // Handle spawn errors (e.g., command not found)
+      child.on('error', (error: Error) => {
+        if (timeoutHandle) {
+          clearTimeout(timeoutHandle)
+        }
+
+        reject(
+          Object.assign(error, {
+            stdout,
+            stderr,
+          })
+        )
+      })
+    })
   }
 
   /**
@@ -486,12 +899,16 @@ export class TerminalTools {
    * This prevents directory traversal attacks where a malicious path
    * could execute commands outside the project directory.
    *
+   * Performance: Uses cached normalized CWD to avoid repeated path.normalize() calls.
+   *
    * @param fullPath - Absolute path to validate
    * @throws Error if path is outside base cwd
    */
   private validatePath(fullPath: string): void {
     const normalizedPath = path.normalize(fullPath)
-    const normalizedCwd = path.normalize(this.cwd)
+
+    // Use cached normalized CWD to avoid repeated normalization
+    const normalizedCwd = this.getNormalizedCwd()
 
     // Check if the path starts with cwd (is within the working directory)
     if (!normalizedPath.startsWith(normalizedCwd)) {
@@ -547,19 +964,27 @@ export class TerminalTools {
  *
  * @param cwd - Current working directory
  * @param env - Optional environment variables
+ * @param retryConfig - Optional default retry configuration
  * @returns TerminalTools instance
  *
  * @example
  * ```typescript
  * const tools = createTerminalTools('/path/to/project', {
  *   NODE_ENV: 'development'
+ * }, {
+ *   maxRetries: 3,
+ *   exponentialBackoff: true
  * })
- * const result = await tools.runTerminalCommand({ command: 'npm test' })
+ * const result = await tools.runTerminalCommand({
+ *   command: 'npm test',
+ *   retry: true
+ * })
  * ```
  */
 export function createTerminalTools(
   cwd: string,
-  env?: Record<string, string>
+  env?: Record<string, string>,
+  retryConfig?: Partial<RetryConfig>
 ): TerminalTools {
-  return new TerminalTools(cwd, env)
+  return new TerminalTools(cwd, env, retryConfig)
 }

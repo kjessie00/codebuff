@@ -402,7 +402,7 @@ export class HandleStepsExecutor {
       if (toolCall.toolName === 'set_output' && 'output' in toolCall.input) {
         updatedAgentState = {
           ...currentAgentState,
-          output: toolCall.input.output as Record<string, any>,
+          output: (toolCall.input as { output: unknown }).output as Record<string, any> | undefined,
         }
         this.logger('Agent output updated via set_output tool')
       }
@@ -526,12 +526,15 @@ export class HandleStepsExecutor {
    * Type guard to check if a value is a ToolCall object
    */
   private isToolCall(value: unknown): value is ToolCall {
+    if (typeof value !== 'object' || value === null) {
+      return false
+    }
+
+    const obj = value as Record<string, unknown>
     return (
-      typeof value === 'object' &&
-      value !== null &&
-      'toolName' in value &&
-      'input' in value &&
-      typeof (value as any).toolName === 'string'
+      'toolName' in obj &&
+      'input' in obj &&
+      typeof obj.toolName === 'string'
     )
   }
 
@@ -539,13 +542,16 @@ export class HandleStepsExecutor {
    * Type guard to check if a value is a StepText object
    */
   private isStepText(value: unknown): value is StepText {
+    if (typeof value !== 'object' || value === null) {
+      return false
+    }
+
+    const obj = value as Record<string, unknown>
     return (
-      typeof value === 'object' &&
-      value !== null &&
-      'type' in value &&
-      (value as any).type === 'STEP_TEXT' &&
-      'text' in value &&
-      typeof (value as any).text === 'string'
+      'type' in obj &&
+      obj.type === 'STEP_TEXT' &&
+      'text' in obj &&
+      typeof obj.text === 'string'
     )
   }
 }

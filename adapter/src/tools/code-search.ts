@@ -8,12 +8,9 @@
  * @module code-search
  */
 
-import { exec } from 'child_process'
-import { promisify } from 'util'
+import { spawn } from 'child_process'
 import * as path from 'path'
 import { glob } from 'glob'
-
-const execAsync = promisify(exec)
 
 /**
  * Tool result output format matching Codebuff's expectations
@@ -83,6 +80,72 @@ export interface SearchResult {
 }
 
 /**
+ * Validate regex pattern to prevent injection attacks
+ *
+ * Checks that a regex pattern doesn't contain shell metacharacters that
+ * could be exploited for command injection.
+ *
+ * @param pattern - Regex pattern to validate
+ * @throws Error if pattern contains dangerous characters
+ *
+ * @security Prevents command injection through regex patterns by rejecting
+ * shell metacharacters that could escape ripgrep's argument parsing.
+ */
+function validateRegexPattern(pattern: string): void {
+  // Check for dangerous shell metacharacters
+  // Note: We allow regex special chars like *, +, ?, etc. but not shell operators
+  const dangerousChars = /[;&|`$()<>]/
+
+  if (dangerousChars.test(pattern)) {
+    throw new Error(
+      'Invalid regex pattern: contains shell metacharacters that could enable command injection'
+    )
+  }
+}
+
+/**
+ * Validate file pattern/glob to prevent injection
+ *
+ * Ensures file patterns don't contain shell metacharacters.
+ *
+ * @param pattern - File pattern to validate
+ * @throws Error if pattern contains dangerous characters
+ *
+ * @security Prevents command injection through file pattern arguments
+ */
+function validateFilePattern(pattern: string): void {
+  const dangerousChars = /[;&|`$()<>]/
+
+  if (dangerousChars.test(pattern)) {
+    throw new Error(
+      'Invalid file pattern: contains shell metacharacters that could enable command injection'
+    )
+  }
+}
+
+/**
+ * Validate path to prevent directory traversal
+ *
+ * Ensures paths don't attempt to escape the working directory.
+ *
+ * @param basePath - Base working directory
+ * @param targetPath - Path to validate
+ * @throws Error if path attempts traversal outside base directory
+ *
+ * @security Prevents directory traversal attacks
+ */
+function validateSearchPath(basePath: string, targetPath: string): void {
+  const normalizedTarget = path.normalize(targetPath)
+  const normalizedBase = path.normalize(basePath)
+
+  if (!normalizedTarget.startsWith(normalizedBase)) {
+    throw new Error(
+      `Path traversal detected: ${targetPath} is outside working directory`
+    )
+  }
+}
+
+/**
  * Code Search Tools implementation
  *
  * Provides code searching and file finding operations that map
@@ -104,6 +167,9 @@ export class CodeSearchTools {
    *
    * @param input - Object containing search query and options
    * @returns Promise resolving to tool result with search matches
+   *
+   * @security Uses spawn() with argument arrays instead of shell execution
+   * to prevent command injection. Validates all inputs before execution.
    *
    * @example
    * ```typescript
@@ -129,57 +195,43 @@ export class CodeSearchTools {
         maxResults = 250
       } = input
 
+      // Validate inputs to prevent injection attacks
+      validateRegexPattern(query)
+      if (file_pattern) {
+        validateFilePattern(file_pattern)
+      }
+
       // Determine search directory
       const searchDir = searchCwd
         ? path.resolve(this.cwd, searchCwd)
         : this.cwd
 
-      // Build ripgrep command arguments
+      // Validate search directory is within working directory
+      validateSearchPath(this.cwd, searchDir)
+
+      // Build ripgrep command arguments as an array (SECURITY: not a string!)
       const args: string[] = [
-        'rg',
         '--json', // Output as JSON for structured parsing
         '--no-heading',
         '--line-number',
         '--column',
-        case_sensitive ? '' : '-i', // Case-insensitive by default
       ]
+
+      // Add case-insensitive flag if needed
+      if (!case_sensitive) {
+        args.push('-i')
+      }
 
       // Add file pattern if specified
       if (file_pattern) {
-        args.push('--glob', `"${file_pattern}"`)
+        args.push('--glob', file_pattern) // Passed as separate arguments
       }
 
-      // Add the search pattern and directory
-      args.push(`"${query}"`, `"${searchDir}"`)
+      // Add the search pattern and directory as separate arguments
+      args.push(query, searchDir)
 
-      // Filter out empty strings and join
-      const command = args.filter(Boolean).join(' ')
-
-      // Execute ripgrep
-      let stdout: string
-      try {
-        const result = await execAsync(command, {
-          maxBuffer: 10 * 1024 * 1024, // 10MB buffer
-          encoding: 'utf-8'
-        })
-        stdout = result.stdout
-      } catch (error: any) {
-        // ripgrep exit code 1 means no matches found (not an error)
-        if (error.code === 1) {
-          return [
-            {
-              type: 'json',
-              value: {
-                results: [],
-                total: 0,
-                query,
-                message: 'No matches found'
-              }
-            }
-          ]
-        }
-        throw error
-      }
+      // Execute ripgrep using spawn (SECURITY: shell: false prevents injection)
+      const stdout = await this.executeRipgrep(args)
 
       // Parse JSON Lines output from ripgrep
       const results: SearchResult[] = []
@@ -357,6 +409,65 @@ export class CodeSearchTools {
   // ============================================================================
 
   /**
+   * Execute ripgrep with given arguments using spawn
+   *
+   * Uses spawn() instead of exec() to prevent command injection vulnerabilities.
+   * Arguments are passed as an array, not concatenated into a shell command.
+   *
+   * @param args - Array of arguments to pass to ripgrep
+   * @returns Promise resolving to stdout from ripgrep
+   *
+   * @security Uses spawn with shell: false to prevent command injection.
+   * Arguments are passed as array elements, never concatenated.
+   *
+   * @throws Error if ripgrep execution fails or times out
+   */
+  private async executeRipgrep(args: string[]): Promise<string> {
+    return new Promise((resolve, reject) => {
+      // Use spawn with shell: false to prevent command injection
+      const child = spawn('rg', args, {
+        shell: false, // SECURITY: Critical - prevents shell interpretation
+      })
+
+      let stdout = ''
+      let stderr = ''
+
+      // Collect stdout
+      child.stdout.on('data', (data: Buffer) => {
+        stdout += data.toString('utf-8')
+      })
+
+      // Collect stderr
+      child.stderr.on('data', (data: Buffer) => {
+        stderr += data.toString('utf-8')
+      })
+
+      // Handle process exit
+      child.on('close', (code: number | null) => {
+        // ripgrep exit code 1 means no matches found (not an error for us)
+        if (code === 1) {
+          resolve('') // No matches, return empty string
+        } else if (code === 0) {
+          resolve(stdout)
+        } else {
+          reject(new Error(`ripgrep failed with code ${code}: ${stderr}`))
+        }
+      })
+
+      // Handle spawn errors (e.g., ripgrep not installed)
+      child.on('error', (error: Error) => {
+        reject(new Error(`Failed to execute ripgrep: ${error.message}`))
+      })
+
+      // Set timeout to prevent hanging
+      setTimeout(() => {
+        child.kill('SIGTERM')
+        reject(new Error('ripgrep execution timed out'))
+      }, 60000) // 60 second timeout
+    })
+  }
+
+  /**
    * Format an error object into a user-friendly string
    *
    * @param error - Error to format
@@ -375,12 +486,33 @@ export class CodeSearchTools {
   /**
    * Verify that ripgrep is available on the system
    *
+   * Uses secure spawn-based execution to check ripgrep availability.
+   *
    * @returns true if ripgrep is available, false otherwise
+   *
+   * @security Uses spawn() instead of exec() to prevent injection
    */
   async verifyRipgrep(): Promise<boolean> {
     try {
-      await execAsync('rg --version')
-      return true
+      const child = spawn('rg', ['--version'], {
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      return new Promise((resolve) => {
+        child.on('close', (code) => {
+          resolve(code === 0)
+        })
+        child.on('error', () => {
+          resolve(false)
+        })
+
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          child.kill()
+          resolve(false)
+        }, 5000)
+      })
     } catch {
       return false
     }
@@ -389,13 +521,45 @@ export class CodeSearchTools {
   /**
    * Get ripgrep version information
    *
+   * Uses secure spawn-based execution to get version.
+   *
    * @returns Version string or null if ripgrep is not available
+   *
+   * @security Uses spawn() instead of exec() to prevent injection
    */
   async getRipgrepVersion(): Promise<string | null> {
     try {
-      const { stdout } = await execAsync('rg --version')
-      const match = stdout.match(/ripgrep (\S+)/)
-      return match ? match[1] : null
+      const child = spawn('rg', ['--version'], {
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+
+      return new Promise((resolve) => {
+        let stdout = ''
+
+        child.stdout?.on('data', (data: Buffer) => {
+          stdout += data.toString('utf-8')
+        })
+
+        child.on('close', (code) => {
+          if (code === 0 && stdout) {
+            const match = stdout.match(/ripgrep (\S+)/)
+            resolve(match ? match[1] : null)
+          } else {
+            resolve(null)
+          }
+        })
+
+        child.on('error', () => {
+          resolve(null)
+        })
+
+        // Timeout after 5 seconds
+        setTimeout(() => {
+          child.kill()
+          resolve(null)
+        }, 5000)
+      })
     } catch {
       return null
     }

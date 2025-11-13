@@ -36,6 +36,23 @@ export interface SpawnAgentsParams {
     /** Parameters object for the agent (if any) */
     params?: Record<string, any>
   }>
+
+  /**
+   * Enable parallel execution of agents (default: false)
+   *
+   * Trade-offs:
+   * - Parallel mode: Faster execution (all agents run concurrently)
+   *   - Best for: Independent agents, read-only operations, gathering data
+   *   - Risk: Resource contention, harder to debug, potential Claude CLI issues
+   *
+   * - Sequential mode: Safer and more predictable (one agent at a time)
+   *   - Best for: Dependent agents, write operations, when order matters
+   *   - Limitation: Slower when agents don't depend on each other
+   *
+   * Note: Parallel mode may not work reliably if Claude CLI doesn't support
+   * concurrent Task tool executions. Test thoroughly before using in production.
+   */
+  parallel?: boolean
 }
 
 /**
@@ -126,57 +143,80 @@ export class SpawnAgentsAdapter {
   ) {}
 
   /**
-   * Spawn multiple agents and execute them sequentially
+   * Spawn multiple agents and execute them
    *
    * This is the main implementation of the spawn_agents tool.
-   * Executes each agent in sequence, collecting results and handling errors.
+   * Supports both sequential (default) and parallel execution modes.
    *
-   * Note: Sequential execution is a limitation of Claude CLI's Task tool,
-   * which doesn't support parallel agent execution like Codebuff does.
+   * Execution modes:
+   * - Sequential (default): Agents run one at a time - safer, more predictable
+   * - Parallel (opt-in): Agents run concurrently - faster, but less predictable
    *
-   * @param input - Object containing array of agents to spawn
+   * @param input - Object containing array of agents to spawn and execution options
    * @param parentContext - Context from the parent agent (for inheritance)
    * @returns Promise resolving to tool result with all agent outputs
    *
    * @example
    * ```typescript
+   * // Sequential execution (default)
    * const result = await adapter.spawnAgents({
    *   agents: [
-   *     {
-   *       agent_type: 'file-picker',
-   *       prompt: 'Find all test files',
-   *       params: { pattern: '*.test.ts' }
-   *     },
-   *     {
-   *       agent_type: 'code-reviewer',
-   *       prompt: 'Review the test files'
-   *     }
+   *     { agent_type: 'file-picker', prompt: 'Find test files' },
+   *     { agent_type: 'code-reviewer', prompt: 'Review the files' }
    *   ]
    * }, parentContext)
    *
-   * // result[0].value = [
-   * //   {
-   * //     agentType: 'file-picker',
-   * //     agentName: 'File Picker',
-   * //     value: { files: [...] }
-   * //   },
-   * //   {
-   * //     agentType: 'code-reviewer',
-   * //     agentName: 'Code Reviewer',
-   * //     value: { review: '...' }
-   * //   }
-   * // ]
+   * // Parallel execution (faster, opt-in)
+   * const result = await adapter.spawnAgents({
+   *   agents: [
+   *     { agent_type: 'analyzer1', prompt: 'Analyze module A' },
+   *     { agent_type: 'analyzer2', prompt: 'Analyze module B' }
+   *   ],
+   *   parallel: true  // Enable parallel execution
+   * }, parentContext)
    * ```
    */
   async spawnAgents(
     input: SpawnAgentsParams,
     parentContext: AgentExecutionContext
   ): Promise<ToolResultOutput[]> {
+    // Choose execution strategy based on parallel flag
+    if (input.parallel === true) {
+      return this.spawnAgentsParallel(input, parentContext)
+    } else {
+      return this.spawnAgentsSequential(input, parentContext)
+    }
+  }
+
+  /**
+   * Spawn agents sequentially (one at a time)
+   *
+   * This is the default and safest execution mode. Agents are executed
+   * one after another, which is slower but more predictable and reliable.
+   *
+   * Benefits:
+   * - Predictable execution order
+   * - No resource contention
+   * - Easier to debug
+   * - Works reliably with Claude CLI Task tool
+   *
+   * Use when:
+   * - Agents depend on each other's results
+   * - Performing write operations
+   * - Order of execution matters
+   * - Maximum reliability is needed
+   *
+   * @param input - Object containing array of agents to spawn
+   * @param parentContext - Context from the parent agent
+   * @returns Promise resolving to tool result with all agent outputs
+   */
+  private async spawnAgentsSequential(
+    input: SpawnAgentsParams,
+    parentContext: AgentExecutionContext
+  ): Promise<ToolResultOutput[]> {
     const results: SpawnedAgentResult[] = []
 
-    // NOTE: Sequential execution due to Claude Code CLI Task tool limitation
-    // This is slower than Codebuff's parallel Promise.allSettled approach,
-    // but is necessary for Claude CLI compatibility
+    // Execute agents one at a time
     for (const agentSpec of input.agents) {
       try {
         // Look up agent definition in registry
@@ -232,33 +272,45 @@ export class SpawnAgentsAdapter {
   }
 
   /**
-   * Spawn agents in parallel (experimental)
+   * Spawn agents in parallel (opt-in via parallel: true parameter)
    *
-   * This is an experimental version that attempts to spawn agents in parallel.
-   * It may work if Claude Code CLI supports multiple concurrent Task executions,
-   * but this is not guaranteed.
+   * Executes all agents concurrently using Promise.allSettled for maximum
+   * performance when agents are independent.
    *
-   * WARNING: This is not the default implementation because Claude CLI may not
-   * support concurrent agent execution. Use at your own risk.
+   * Benefits:
+   * - Much faster than sequential (all agents run at once)
+   * - Good for read-only operations
+   * - Ideal when agents don't depend on each other
+   *
+   * Trade-offs:
+   * - May cause resource contention
+   * - Harder to debug when errors occur
+   * - Unpredictable execution order
+   * - May not work reliably with Claude CLI Task tool limitations
+   *
+   * Use when:
+   * - Agents are completely independent
+   * - Performing read-only operations
+   * - Speed is more important than reliability
+   * - You've tested it works in your environment
    *
    * @param input - Object containing array of agents to spawn
    * @param parentContext - Context from the parent agent
    * @returns Promise resolving to tool result with all agent outputs
    *
-   * @experimental
-   *
    * @example
    * ```typescript
-   * // Enable experimental parallel execution
-   * const result = await adapter.spawnAgentsParallel({
+   * // Use via parallel parameter
+   * const result = await adapter.spawnAgents({
    *   agents: [
    *     { agent_type: 'agent1', prompt: 'Task 1' },
    *     { agent_type: 'agent2', prompt: 'Task 2' }
-   *   ]
+   *   ],
+   *   parallel: true  // Enable parallel execution
    * }, parentContext)
    * ```
    */
-  async spawnAgentsParallel(
+  private async spawnAgentsParallel(
     input: SpawnAgentsParams,
     parentContext: AgentExecutionContext
   ): Promise<ToolResultOutput[]> {
