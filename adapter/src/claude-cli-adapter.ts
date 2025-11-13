@@ -127,6 +127,9 @@ export class ClaudeCodeCLIAdapter {
   // Configuration
   private readonly config: Required<AdapterConfig>
 
+  // API key availability flag
+  private readonly hasApiKey: boolean
+
   // Execution contexts (tracked by agent ID)
   private readonly contexts: Map<string, AgentExecutionContext> = new Map()
 
@@ -148,9 +151,13 @@ export class ClaudeCodeCLIAdapter {
    * @param config - Adapter configuration
    */
   constructor(config: AdapterConfig) {
+    // Detect API key availability
+    this.hasApiKey = !!config.anthropicApiKey
+
     // Apply default configuration
     this.config = {
       cwd: config.cwd,
+      anthropicApiKey: config.anthropicApiKey ?? undefined,
       env: config.env ?? {},
       maxSteps: config.maxSteps ?? 20,
       debug: config.debug ?? false,
@@ -167,6 +174,13 @@ export class ClaudeCodeCLIAdapter {
         llmInvocationTimeoutMs: 60000,
         terminalCommandTimeoutMs: 30000,
       },
+    } as Required<AdapterConfig>
+
+    // Log mode detection
+    if (this.hasApiKey && this.config.debug) {
+      this.log('✅ API key detected - Full multi-agent support enabled (PAID mode)')
+    } else if (this.config.debug) {
+      this.log('ℹ️  No API key - Free mode (spawn_agents disabled)')
     }
 
     // Initialize tool implementations
@@ -190,6 +204,7 @@ export class ClaudeCodeCLIAdapter {
     this.log('ClaudeCodeCLIAdapter initialized', {
       cwd: this.config.cwd,
       maxSteps: this.config.maxSteps,
+      mode: this.hasApiKey ? 'PAID' : 'FREE',
     })
   }
 
@@ -878,6 +893,15 @@ export class ClaudeCodeCLIAdapter {
    */
   getActiveContexts(): Map<string, AgentExecutionContext> {
     return new Map(this.contexts)
+  }
+
+  /**
+   * Check if API key is available (PAID mode)
+   *
+   * @returns True if API key is configured
+   */
+  hasApiKeyAvailable(): boolean {
+    return this.hasApiKey
   }
 }
 

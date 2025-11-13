@@ -90,6 +90,9 @@ export interface AdapterConfig {
   /** Working directory for all operations */
   cwd: string
 
+  /** Optional Anthropic API key for PAID mode (enables spawn_agents) */
+  anthropicApiKey?: string
+
   /** Environment variables to pass to tools */
   env?: Record<string, string>
 

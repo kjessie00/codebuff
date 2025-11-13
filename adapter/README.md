@@ -1,10 +1,11 @@
 # Claude Code CLI Adapter for Codebuff
 
-A production-ready adapter that bridges Codebuff's agent definition system with Claude Code CLI tools, enabling free, local, and private execution of Codebuff agents.
+A production-ready adapter that bridges Codebuff's agent definition system with Claude Code CLI tools, supporting both **FREE** and **PAID** modes for flexible agent execution.
 
 ## Table of Contents
 
 - [Overview](#overview)
+- [Hybrid Mode (FREE vs PAID)](#hybrid-mode-free-vs-paid)
 - [Installation and Setup](#installation-and-setup)
 - [Quick Start Guide](#quick-start-guide)
 - [Architecture Overview](#architecture-overview)
@@ -18,13 +19,104 @@ A production-ready adapter that bridges Codebuff's agent definition system with 
 
 ### What is the Claude CLI Adapter?
 
-The Claude CLI Adapter enables you to run Codebuff agents locally using Claude Code CLI instead of paid API services (OpenRouter). It provides:
+The Claude CLI Adapter enables you to run Codebuff agents with flexible deployment options. It provides:
 
-- **Zero API Costs**: Completely free local execution
-- **Full Privacy**: All processing happens locally on your machine
+- **Hybrid Mode**: Choose between FREE (no API key) or PAID (with API key) operation
+- **FREE Mode**: Zero cost for file operations, code search, and terminal commands
+- **PAID Mode**: Full multi-agent orchestration with `spawn_agents` support
 - **100% Compatibility**: Works with existing Codebuff `AgentDefinition` types
 - **Generator Support**: Full support for `handleSteps` generator pattern
 - **Tool Mapping**: Direct mapping of Codebuff tools to Claude Code CLI tools
+
+## Hybrid Mode (FREE vs PAID)
+
+The adapter supports **TWO operational modes** to give you maximum flexibility:
+
+### FREE Mode (No API Key) - Default
+
+**Perfect for simple automation and file operations**
+
+- **Cost:** $0.00 - Completely free
+- **What Works:**
+  - ✅ File operations (`read_files`, `write_file`, `str_replace`)
+  - ✅ Code search (`code_search`, `find_files`)
+  - ✅ Terminal commands (`run_terminal_command`)
+  - ✅ Single agent execution
+  - ✅ Output control (`set_output`)
+- **What Doesn't Work:**
+  - ❌ Multi-agent orchestration (`spawn_agents`)
+- **Privacy:** 100% local processing
+- **Use Cases:** File manipulation, code analysis, build automation
+
+**Example:**
+```typescript
+import { ClaudeCodeCLIAdapter } from '@codebuff/adapter'
+
+// FREE mode - no API key needed
+const adapter = new ClaudeCodeCLIAdapter({
+  cwd: process.cwd(),
+  debug: true // Shows "No API key - Free mode"
+})
+```
+
+### PAID Mode (With API Key) - Opt-In
+
+**Unlock full multi-agent capabilities**
+
+- **Cost:** ~$3-15 per 1M tokens (Claude Sonnet 4 pricing)
+- **What Works:**
+  - ✅ Everything from FREE mode
+  - ✅ **Multi-agent orchestration** (`spawn_agents`)
+  - ✅ Parallel agent execution
+  - ✅ Complex nested workflows
+- **Privacy:** Data sent to Anthropic API (industry-standard encryption)
+- **Use Cases:** Complex multi-agent workflows, orchestrated tasks
+
+**Example:**
+```typescript
+import { ClaudeCodeCLIAdapter } from '@codebuff/adapter'
+
+// PAID mode - API key enables spawn_agents
+const adapter = new ClaudeCodeCLIAdapter({
+  cwd: process.cwd(),
+  anthropicApiKey: process.env.ANTHROPIC_API_KEY, // Enable PAID features
+  debug: true // Shows "API key detected - Full multi-agent support enabled"
+})
+```
+
+### Quick Comparison
+
+| Feature | FREE Mode | PAID Mode |
+|---------|-----------|-----------|
+| Cost | $0.00 | ~$3-15/1M tokens |
+| File Operations | ✅ | ✅ |
+| Code Search | ✅ | ✅ |
+| Terminal Commands | ✅ | ✅ |
+| spawn_agents | ❌ | ✅ |
+| Multi-agent workflows | ❌ | ✅ |
+| API Required | No | Yes |
+
+### Getting Started with PAID Mode
+
+1. **Get an API key:**
+   - Sign up at [https://console.anthropic.com](https://console.anthropic.com)
+   - Navigate to Settings → API Keys
+   - Create a new key (starts with `sk-ant-...`)
+
+2. **Set environment variable:**
+   ```bash
+   export ANTHROPIC_API_KEY="sk-ant-..."
+   ```
+
+3. **Enable in adapter:**
+   ```typescript
+   const adapter = new ClaudeCodeCLIAdapter({
+     cwd: process.cwd(),
+     anthropicApiKey: process.env.ANTHROPIC_API_KEY,
+   })
+   ```
+
+**For complete details, see [HYBRID_MODE_GUIDE.md](./HYBRID_MODE_GUIDE.md)**
 
 ### Key Features
 
@@ -37,15 +129,20 @@ The Claude CLI Adapter enables you to run Codebuff agents locally using Claude C
 
 ### Why Use This Adapter?
 
-**Before (Codebuff with OpenRouter API):**
-- Cost: ~$0.50-$2.00 per session
-- Privacy: Code sent to external servers
-- Speed: Network latency for each LLM call
+**Compared to OpenRouter API:**
 
-**After (Codebuff with Claude CLI Adapter):**
-- Cost: $0 (completely free)
-- Privacy: 100% local processing
-- Speed: Similar or faster (no network overhead for tool calls)
+| Aspect | OpenRouter API | FREE Mode | PAID Mode |
+|--------|----------------|-----------|-----------|
+| **Cost** | ~$0.50-$2.00/session | **$0.00** | ~$0.10-$0.60/session |
+| **Privacy** | External servers | **100% local** | Anthropic API |
+| **Speed** | Network latency | Fast (local) | Fast (optimized API) |
+| **Multi-agent** | ✅ Yes | ❌ No | ✅ Yes |
+| **Setup** | API key required | **No setup** | API key required |
+
+**Choose your mode based on needs:**
+- **FREE Mode**: Perfect for 80% of use cases (file ops, code search, terminal)
+- **PAID Mode**: Only when you need complex multi-agent orchestration
+- **Flexibility**: Switch between modes as needed, or use both in same app
 
 ## Installation and Setup
 

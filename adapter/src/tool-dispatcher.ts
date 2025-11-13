@@ -26,6 +26,9 @@ export interface ToolDispatcherConfig {
   /** Current working directory */
   cwd: string
 
+  /** Whether API key is available (enables spawn_agents) */
+  hasApiKey?: boolean
+
   /** Environment variables for terminal commands */
   env?: Record<string, string>
 
@@ -63,7 +66,8 @@ export interface ToolDispatcherConfig {
  * ```
  */
 export class ToolDispatcher {
-  private readonly config: Required<ToolDispatcherConfig>
+  private readonly config: Required<Omit<ToolDispatcherConfig, 'hasApiKey'>>
+  private readonly hasApiKey: boolean
   private readonly fileOps: FileOperationsTools
   private readonly codeSearch: CodeSearchTools
   private readonly terminal: TerminalTools
@@ -85,6 +89,8 @@ export class ToolDispatcher {
       debug: config.debug ?? false,
       logger: config.logger ?? this.defaultLogger,
     }
+
+    this.hasApiKey = config.hasApiKey ?? false
 
     // Initialize tool implementations
     this.fileOps = new FileOperationsTools(this.config.cwd)
@@ -242,14 +248,43 @@ export class ToolDispatcher {
    *
    * Spawns and executes sub-agents.
    *
+   * REQUIRES API KEY (PAID mode):
+   * This tool only works when an Anthropic API key is provided.
+   * Returns an error in FREE mode.
+   *
    * @param input - Tool input containing agent specifications
    * @param context - Current execution context
-   * @returns Tool result with agent outputs
+   * @returns Tool result with agent outputs or error
    */
   private async executeSpawnAgents(
     input: any,
     context: AgentExecutionContext
   ): Promise<ToolResultOutput[]> {
+    // Check if API key is available
+    if (!this.hasApiKey) {
+      return [
+        {
+          type: 'json',
+          value: {
+            error: 'spawn_agents requires Anthropic API key',
+            message: 'This tool is only available in PAID mode.\n' +
+                     'Set anthropicApiKey in config to enable multi-agent features.\n\n' +
+                     'To upgrade:\n' +
+                     '1. Get an API key from https://console.anthropic.com\n' +
+                     '2. Set it in your adapter config:\n' +
+                     '   new ClaudeCodeCLIAdapter({\n' +
+                     '     cwd: process.cwd(),\n' +
+                     '     anthropicApiKey: process.env.ANTHROPIC_API_KEY\n' +
+                     '   })\n\n' +
+                     'See HYBRID_MODE_GUIDE.md for more details.',
+            mode: 'FREE',
+            requiredMode: 'PAID',
+          },
+        },
+      ]
+    }
+
+    // Proceed with spawn_agents
     return await this.spawnAgents.spawnAgents(input, context)
   }
 

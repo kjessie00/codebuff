@@ -11,13 +11,20 @@
  * This class provides the bridge between the agent framework and
  * the actual Claude Code CLI LLM interface.
  *
+ * HYBRID MODE SUPPORT:
+ * - FREE mode: No API key, spawn_agents disabled
+ * - PAID mode: API key provided, full multi-agent support via Anthropic API
+ *
  * @module llm-executor
  */
 
 import type { AgentDefinition, AgentState } from '../../.agents/types/agent-definition'
 import type { Message } from '../../.agents/types/util-types'
 import type { AgentExecutionContext } from './types'
+import type { ToolCall } from '../../.agents/types/agent-definition'
+import type { ToolResultOutput } from '../../.agents/types/util-types'
 import { MAX_STEP_ALL_ITERATIONS, MAX_PROMPT_DISPLAY_LENGTH } from './utils/constants'
+import { AnthropicAPIIntegration } from './anthropic-api-integration'
 
 /**
  * Parameters for Claude invocation
@@ -37,6 +44,9 @@ export interface ClaudeInvocationParams {
  * Configuration for LLMExecutor
  */
 export interface LLMExecutorConfig {
+  /** Optional Anthropic API key for PAID mode */
+  anthropicApiKey?: string
+
   /** Enable debug logging */
   debug?: boolean
 
@@ -45,6 +55,9 @@ export interface LLMExecutorConfig {
 
   /** Maximum iterations for STEP_ALL mode */
   maxStepAllIterations?: number
+
+  /** Tool executor function (required for API mode) */
+  toolExecutor?: (toolCall: ToolCall) => Promise<ToolResultOutput[]>
 }
 
 /**
@@ -84,7 +97,10 @@ export interface LLMStepResult {
  * ```
  */
 export class LLMExecutor {
-  private readonly config: Required<LLMExecutorConfig>
+  private readonly config: Required<Omit<LLMExecutorConfig, 'anthropicApiKey' | 'toolExecutor'>>
+  private readonly anthropicApiKey?: string
+  private readonly toolExecutor?: (toolCall: ToolCall) => Promise<ToolResultOutput[]>
+  private anthropicIntegration?: AnthropicAPIIntegration
 
   /**
    * Create a new LLMExecutor
@@ -96,6 +112,18 @@ export class LLMExecutor {
       debug: config.debug ?? false,
       logger: config.logger ?? this.defaultLogger,
       maxStepAllIterations: config.maxStepAllIterations ?? MAX_STEP_ALL_ITERATIONS,
+    }
+
+    this.anthropicApiKey = config.anthropicApiKey
+    this.toolExecutor = config.toolExecutor
+
+    // Initialize Anthropic integration if API key is provided
+    if (this.anthropicApiKey) {
+      this.anthropicIntegration = new AnthropicAPIIntegration({
+        apiKey: this.anthropicApiKey,
+        debug: this.config.debug,
+        logger: this.config.logger,
+      })
     }
   }
 
@@ -394,18 +422,18 @@ export class LLMExecutor {
   // ============================================================================
 
   /**
-   * Invoke Claude Code CLI
+   * Invoke Claude
    *
-   * PLACEHOLDER: This needs to be implemented to integrate with actual Claude Code CLI.
+   * HYBRID MODE:
+   * - If API key is provided (PAID mode): Uses Anthropic API integration
+   * - If no API key (FREE mode): Throws error (LLM invocation requires API key)
    *
-   * Possible approaches:
-   * 1. Use Claude Code CLI internal API (if available)
-   * 2. File-based communication (input/output files)
-   * 3. stdin/stdout pipe
-   * 4. HTTP API (if Claude CLI exposes one)
+   * For FREE mode, users should use Claude Code CLI directly without this adapter,
+   * or provide an API key to enable full multi-agent support.
    *
    * @param params - Invocation parameters
    * @returns Promise resolving to Claude's response
+   * @throws Error if no API key is configured
    *
    * @example
    * ```typescript
@@ -417,17 +445,23 @@ export class LLMExecutor {
    * ```
    */
   async invokeClaude(params: ClaudeInvocationParams): Promise<string> {
-    // TODO: Implement actual Claude Code CLI integration
-    // This is where we would integrate with the actual LLM
+    // Check if API key is available
+    if (!this.anthropicIntegration || !this.toolExecutor) {
+      throw new Error(
+        'LLM invocation requires Anthropic API key and tool executor. ' +
+        'Set anthropicApiKey in config to enable multi-agent features. ' +
+        'See HYBRID_MODE_GUIDE.md for details.'
+      )
+    }
 
-    this.log('Invoking Claude (PLACEHOLDER)', {
+    this.log('Invoking Claude via Anthropic API', {
       systemPromptLength: params.systemPrompt.length,
       messageCount: params.messages.length,
       toolCount: params.tools.length,
     })
 
-    // Placeholder response
-    return `[Claude Response Placeholder]\nReceived ${params.messages.length} messages with ${params.tools.length} available tools.`
+    // Use the Anthropic API integration
+    return await this.anthropicIntegration.invoke(params, this.toolExecutor)
   }
 
   // ============================================================================
@@ -509,7 +543,11 @@ export class LLMExecutor {
    *
    * @returns Current configuration
    */
-  getConfig(): Readonly<Required<LLMExecutorConfig>> {
-    return { ...this.config }
+  getConfig(): Readonly<LLMExecutorConfig> {
+    return {
+      ...this.config,
+      anthropicApiKey: this.anthropicApiKey,
+      toolExecutor: this.toolExecutor,
+    }
   }
 }
